@@ -23,7 +23,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
-var callIDToOffer = make(map[string]*webrtc.PeerConnection)
+// var callIDToOffer = make(map[string]*webrtc.PeerConnection)
 var mutex = &sync.Mutex{}
 
 type actionData struct {
@@ -32,6 +32,11 @@ type actionData struct {
 }
 
 var actionChannels = sync.Map{}
+
+type callIDDetails struct {
+	pc *webrtc.PeerConnection
+	ch chan actionData
+}
 
 type Offer struct {
 	SDP  string `json:"sdp"`
@@ -134,8 +139,6 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	ch := make(chan actionData, 1)
-
 	// Store peer connection
 	callID := request.CallID
 	// log.Println("Original Call ID:", callID)
@@ -143,8 +146,6 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 		callID = uuid.New().String()
 	}
 	// log.Println("Generated Call ID:", callID)
-
-	actionChannels.Store(callID, ch)
 
 	pc, err := createPeerConnection()
 	if err != nil {
@@ -200,9 +201,17 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 		return Event{}, fmt.Errorf("failed to retrieve local description")
 	}
 
-	mutex.Lock()
-	callIDToOffer[callID] = pc
-	mutex.Unlock()
+	// mutex.Lock()
+	// callIDToOffer[callID] = pc
+	// mutex.Unlock()
+	ch := make(chan actionData, 1)
+
+	details := callIDDetails{
+		pc: pc,
+		ch: ch, // buffered channel (optional)
+	}
+
+	actionChannels.Store(callID, details)
 
 	// ✅ Auto remove PC after timeout
 	go autoRemovePeerConnection(callID, 45*time.Second)
@@ -256,15 +265,16 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 // ✅ Auto remove PC after timeout
 func autoRemovePeerConnection(callID string, duration time.Duration) {
 	time.Sleep(duration)
+	// pc, exists := callIDToOffer[callID]
 
-	mutex.Lock()
-	pc, exists := callIDToOffer[callID]
-	if exists {
-		pc.Close()
-		delete(callIDToOffer, callID)
+	// actionChannels.Delete(callID)
+	if val, ok := actionChannels.Load(callID); ok {
+		details := val.(callIDDetails)
+		details.pc.Close()
+		actionChannels.Delete(callID)
+		// use details.pc or details.ch
 		log.Println("Auto-cleanup: Removed inactive call_id", callID)
 	}
-	mutex.Unlock()
 }
 
 func createCallbackPayload(request OfferRequest, offer Offer, callID string) Event {
@@ -465,12 +475,23 @@ func processAction(c *fiber.Ctx) error {
 	}
 	log.Printf("📩 Parsed action request: %s %s\n", action.CallID, action.Action)
 
-	mutex.Lock()
-	pc, exists := callIDToOffer[action.CallID]
-	mutex.Unlock()
+	// mutex.Lock()
+	// pc, exists := callIDToOffer[action.CallID]
+	// mutex.Unlock()
+	val, ok := actionChannels.Load(action.CallID)
 
-	if !exists {
+	if !ok {
 		// Return a proper JSON response with status, CallID, and Action details
+		return c.JSON(fiber.Map{
+			"status":  "No corresponding offer for this call_id or already closed",
+			"call_id": action.CallID,
+			"action":  action.Action,
+		})
+	}
+
+	details := val.(callIDDetails)
+	pc := details.pc
+	if pc == nil {
 		return c.JSON(fiber.Map{
 			"status":  "No corresponding offer for this call_id or already closed",
 			"call_id": action.CallID,
@@ -486,9 +507,10 @@ func processAction(c *fiber.Ctx) error {
 
 	if _, exists := validCloseActions[action.Action]; exists {
 		pc.Close()
-		mutex.Lock()
-		delete(callIDToOffer, action.CallID)
-		mutex.Unlock()
+		// mutex.Lock()
+		// delete(callIDToOffer, action.CallID)
+		// mutex.Unlock()
+		actionChannels.Delete(action.CallID)
 	}
 
 	if action.Action == "accept" {
@@ -520,16 +542,17 @@ func processAction(c *fiber.Ctx) error {
 		// 	return true // Continue iteration
 		// })
 
-		if ch, ok := actionChannels.Load(action.CallID); ok {
-			log.Printf("📩 Sending action to channel: %s %s\n", action.CallID, action.Action)
-			ch.(chan actionData) <- actionData{
-				Action: action.Action,
-				Data: SessionDescription{
-					Type: "answer",
-					SDP:  sdpString,
-				},
-			}
+		// if ch, ok := actionChannels.Load(action.CallID); ok {
+		log.Printf("📩 Sending action to channel: %s %s\n", action.CallID, action.Action)
+		// ch := details.ch
+		details.ch <- actionData{
+			Action: action.Action,
+			Data: SessionDescription{
+				Type: "answer",
+				SDP:  sdpString,
+			},
 		}
+
 	}
 
 	return c.JSON(fiber.Map{"status": "Action processed successfully"})
@@ -590,9 +613,15 @@ func generateSDPAnswer(request AnswerRequest) (AnswerResponse, error) {
 		callID = uuid.New().String()
 	}
 
-	mutex.Lock()
-	callIDToOffer[callID] = pc
-	mutex.Unlock()
+	// mutex.Lock()
+	// callIDToOffer[callID] = pc
+	// mutex.Unlock()
+	ch := make(chan actionData, 1)
+	details := callIDDetails{
+		pc: pc,
+		ch: ch, // buffered channel (optional)
+	}
+	actionChannels.Store(callID, details)
 
 	go autoRemovePeerConnection(callID, 45*time.Second)
 	go streamAudio(context.Background(), pc, "output.ogg", audioTrack, rtpSender, callID)
@@ -659,11 +688,17 @@ func main() {
 	go func() {
 		<-quit
 		log.Println("Shutting down server...")
-		mutex.Lock()
-		for _, pc := range callIDToOffer {
-			pc.Close()
-		}
-		mutex.Unlock()
+		// mutex.Lock()
+		// for _, pc := range callIDToOffer {
+		// 	pc.Close()
+		// }
+		actionChannels.Range(func(key, value any) bool {
+			details := value.(callIDDetails)
+			details.pc.Close()
+			actionChannels.Delete(key)
+			return true
+		})
+		// mutex.Unlock()
 		os.Exit(0)
 	}()
 
