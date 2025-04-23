@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -24,110 +22,13 @@ import (
 )
 
 // var callIDToOffer = make(map[string]*webrtc.PeerConnection)
-var mutex = &sync.Mutex{}
-
-type actionData struct {
-	Action string
-	Data   SessionDescription
-}
-
-var actionChannels = sync.Map{}
-
-type callIDDetails struct {
-	pc *webrtc.PeerConnection
-	ch chan actionData
-}
-
-type Offer struct {
-	SDP  string `json:"sdp"`
-	Type string `json:"type"`
-}
-
-type OfferRequest struct {
-	To          string `json:"to"`
-	CallbackURL string `json:"callback_url,omitempty"`
-	CallID      string `json:"call_id,omitempty"`
-	From        string `json:"from"`
-}
-
-type OfferResponse struct {
-	CallID           string `json:"call_id"`
-	Offer            Offer  `json:"offer"`
-	CallbackResponse string `json:"callback_response,omitempty"`
-}
-
-type ActionRequest struct {
-	CallID           string         `json:"call_id"`
-	Action           string         `json:"action"`
-	Connection       map[string]any `json:"connection,omitempty"`
-	Session          map[string]any `json:"session,omitempty"`
-	MessagingProduct string         `json:"messaging_product"`
-}
-
-type Call struct {
-	ID         string         `json:"id"`
-	From       string         `json:"from"`
-	To         string         `json:"to"`
-	Event      string         `json:"event"`
-	Timestamp  string         `json:"timestamp"`
-	Direction  string         `json:"direction"`
-	Status     string         `json:"status,omitempty"`
-	Connection map[string]any `json:"connection,omitempty"`
-	Session    map[string]any `json:"session,omitempty"`
-}
-
-type Metadata struct {
-	DisplayPhoneNumber string `json:"display_phone_number"`
-	PhoneNumberID      string `json:"phone_number_id"`
-}
-
-type Value struct {
-	MessagingProduct string   `json:"messaging_product"`
-	Calls            []Call   `json:"calls"`
-	Metadata         Metadata `json:"metadata"`
-	Contacts         any      `json:"contacts"`
-}
-
-type Change struct {
-	Value Value  `json:"value"`
-	Field string `json:"field"`
-}
-
-type Entry struct {
-	ID      string   `json:"id"`
-	Changes []Change `json:"changes"`
-}
-
-type Event struct {
-	Object string  `json:"object"`
-	Entry  []Entry `json:"entry"`
-}
-
-type SessionDescription struct {
-	SDP  string `json:"sdp"`
-	Type string `json:"type"`
-}
-
-type AnswerResponse struct {
-	CallID string             `json:"call_id"`
-	Answer SessionDescription `json:"answer"`
-}
-
-type AnswerRequest struct {
-	CallID           string             `json:"call_id"`
-	To               string             `json:"to"`
-	Action           string             `json:"action"`
-	Session          SessionDescription `json:"session"`
-	MessagingProduct string             `json:"messaging_product"`
-	CallbackURL      string             `json:"callback_url,omitempty"`
-	CallbackData     string             `json:"biz_opaque_callback_data,omitempty"`
-}
+// var mutex = &sync.Mutex{}
 
 func createPeerConnection() (*webrtc.PeerConnection, error) {
 	// config := webrtc.Configuration{
 	// 	ICEServers: []webrtc.ICEServer{
 	// 		{
-	// 			URLs: []string{"stun:stun.l.google.com:19302"},
+	// 			URLs: []string{"stun:stun1.l.google.com:19302"},
 	// 		},
 	// 	},
 	// }
@@ -136,8 +37,6 @@ func createPeerConnection() (*webrtc.PeerConnection, error) {
 }
 
 func generateSDPOffer(request OfferRequest) (Event, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
 
 	// Store peer connection
 	callID := request.CallID
@@ -152,9 +51,9 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 		return Event{}, err
 	}
 
-	pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		log.Printf("%s ICE Connection State has changed: %s\n", callID, connectionState.String())
-	})
+	// pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+	// 	log.Printf("%s ICE Connection State has changed: %s\n", callID, connectionState.String())
+	// })
 
 	// ✅ Create an Opus track
 	audioTrack, err := webrtc.NewTrackLocalStaticSample(
@@ -204,17 +103,18 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 	// mutex.Lock()
 	// callIDToOffer[callID] = pc
 	// mutex.Unlock()
-	ch := make(chan actionData, 1)
+	ch := make(chan ActionData, 1)
+	closech := make(chan int, 1)
 
-	details := callIDDetails{
+	details := CallIDDetails{
 		pc: pc,
 		ch: ch, // buffered channel (optional)
 	}
 
-	actionChannels.Store(callID, details)
+	ActionChannels.Store(callID, details)
 
 	// ✅ Auto remove PC after timeout
-	go autoRemovePeerConnection(callID, 45*time.Second)
+	go autoRemovePeerConnection(callID, 45*time.Second, closech)
 
 	offerResponse := OfferResponse{
 		Offer: Offer{
@@ -231,7 +131,8 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 	}
 
 	go func() {
-		defer actionChannels.Delete(callID)
+		defer log.Println("Leaving generate loop: ", callID)
+		log.Printf("📩 Ready to receive generateSDPOffer answer: %s\n", callID)
 		select {
 		case action := <-ch:
 			log.Printf("📩 Received action: %s %s\n", callID, action.Action)
@@ -250,10 +151,13 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 				}
 
 				// Start streaming audio
-				streamAudio(ctx, pc, "output.ogg", audioTrack, rtpSender, callID)
+				go streamAudio(pc, "output20ms.ogg", audioTrack, rtpSender, callID)
 			}
-		case <-ctx.Done():
+		}
+		select {
+		case <-closech:
 			log.Printf("%s Timeout waiting for answer\n", callID)
+			return
 		}
 	}()
 
@@ -263,18 +167,19 @@ func generateSDPOffer(request OfferRequest) (Event, error) {
 }
 
 // ✅ Auto remove PC after timeout
-func autoRemovePeerConnection(callID string, duration time.Duration) {
+func autoRemovePeerConnection(callID string, duration time.Duration, closech chan int) {
 	time.Sleep(duration)
 	// pc, exists := callIDToOffer[callID]
 
-	// actionChannels.Delete(callID)
-	if val, ok := actionChannels.Load(callID); ok {
-		details := val.(callIDDetails)
+	// ActionChannels.Delete(callID)
+	if val, ok := ActionChannels.Load(callID); ok {
+		details := val.(CallIDDetails)
 		details.pc.Close()
-		actionChannels.Delete(callID)
+		ActionChannels.Delete(callID)
 		// use details.pc or details.ch
 		log.Println("Auto-cleanup: Removed inactive call_id", callID)
 	}
+	closech <- 1
 }
 
 func createCallbackPayload(request OfferRequest, offer Offer, callID string) Event {
@@ -382,28 +287,25 @@ func sendCallbackAsync(callbackURL string, payload Event) {
 	}()
 }
 
-func streamAudio(ctx context.Context, pc *webrtc.PeerConnection, filename string, audioTrack *webrtc.TrackLocalStaticSample, rtpSender *webrtc.RTPSender, callID string) {
+func streamAudio(pc *webrtc.PeerConnection, filename string, audioTrack *webrtc.TrackLocalStaticSample, rtpSender *webrtc.RTPSender, callID string) {
 	log.Println("🎵 Starting audio streaming...")
 
-	pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		log.Printf("%s ICE Connection State has changed: %s\n", callID, connectionState.String())
-	})
+	// pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+	// 	log.Printf("%s ICE Connection State has changed: %s\n", callID, connectionState.String())
+	// })
 
 	// Wait for ICE connection to be established
-	iceConnected := make(chan struct{})
+	iceConnected := make(chan int, 1)
 	pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		log.Printf("%s ICE Connection State has changed: %s\n", callID, connectionState.String())
 		if connectionState == webrtc.ICEConnectionStateConnected {
-			close(iceConnected)
+			log.Printf("%s ICE connection established\n", callID)
+			iceConnected <- 1
+		}
+		if connectionState == webrtc.ICEConnectionStateDisconnected {
+			iceConnected <- 2
 		}
 	})
-
-	select {
-	case <-iceConnected:
-		log.Printf("%s ICE connection established\n", callID)
-	case <-ctx.Done():
-		log.Printf("%s ICE connection timeout\n", callID)
-		return
-	}
 
 	//✅ Handle RTCP (optional debugging)
 	go func() {
@@ -411,6 +313,7 @@ func streamAudio(ctx context.Context, pc *webrtc.PeerConnection, filename string
 		for {
 			_, _, rtcpErr := rtpSender.Read(rtcpBuf)
 			if rtcpErr != nil {
+				log.Printf("%s Error reading RTCP: %v\n", callID, rtcpErr)
 				return
 			}
 		}
@@ -432,15 +335,23 @@ func streamAudio(ctx context.Context, pc *webrtc.PeerConnection, filename string
 			return
 		}
 
+		select {
+		case state := <-iceConnected:
+			if state == 1 {
+				log.Printf("%s ICE connection established break loop\n", callID)
+			}
+			if state == 2 {
+				log.Printf("%s ICE connection disconnected, breaking loop\n", callID)
+				return
+			}
+		}
+
 		// ✅ Initialize timing
 		var lastGranule uint64
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
-				log.Printf("%s Audio streaming stopped due to timeout\n", callID)
-				return
 			case <-ticker.C:
 				// ✅ Read Ogg packet
 				pageData, pageHeader, oggErr := ogg.ParseNextPage()
@@ -462,7 +373,18 @@ func streamAudio(ctx context.Context, pc *webrtc.PeerConnection, filename string
 					return
 				}
 
-				log.Printf("%s Sent Ogg packet of size %d bytes, duration %s\n", callID, len(pageData), sampleDuration)
+				// if sampleDuration > 0 {
+				// 	time.Sleep(sampleDuration)
+				// }
+
+				// log.Printf("%s Sent Ogg packet of size %d bytes, duration %s\n", callID, len(pageData), sampleDuration)
+			case state := <-iceConnected:
+				if state == 2 {
+					log.Printf("%s ICE connection disconnected, breaking loop\n", callID)
+					return
+				}
+				log.Printf("%s ICE connection established break loop\n", callID)
+				break
 			}
 		}
 	}()
@@ -478,7 +400,7 @@ func processAction(c *fiber.Ctx) error {
 	// mutex.Lock()
 	// pc, exists := callIDToOffer[action.CallID]
 	// mutex.Unlock()
-	val, ok := actionChannels.Load(action.CallID)
+	val, ok := ActionChannels.Load(action.CallID)
 
 	if !ok {
 		// Return a proper JSON response with status, CallID, and Action details
@@ -489,7 +411,7 @@ func processAction(c *fiber.Ctx) error {
 		})
 	}
 
-	details := val.(callIDDetails)
+	details := val.(CallIDDetails)
 	pc := details.pc
 	if pc == nil {
 		return c.JSON(fiber.Map{
@@ -510,7 +432,7 @@ func processAction(c *fiber.Ctx) error {
 		// mutex.Lock()
 		// delete(callIDToOffer, action.CallID)
 		// mutex.Unlock()
-		actionChannels.Delete(action.CallID)
+		ActionChannels.Delete(action.CallID)
 	}
 
 	if action.Action == "accept" {
@@ -533,19 +455,11 @@ func processAction(c *fiber.Ctx) error {
 		if !found {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "SDP data missing"})
 		}
-		// log.Printf("📩 SDP data found: %s\n", sdpString)
-		// Send the action to the channel
-		// log.Printf("📩 Sending action to channel for CallID: %s\n", action.CallID)
 
-		// actionChannels.Range(func(key, value any) bool {
-		// 	log.Printf("Key: %v, Value: %v\n", key, value)
-		// 	return true // Continue iteration
-		// })
-
-		// if ch, ok := actionChannels.Load(action.CallID); ok {
+		// if ch, ok := ActionChannels.Load(action.CallID); ok {
 		log.Printf("📩 Sending action to channel: %s %s\n", action.CallID, action.Action)
 		// ch := details.ch
-		details.ch <- actionData{
+		details.ch <- ActionData{
 			Action: action.Action,
 			Data: SessionDescription{
 				Type: "answer",
@@ -616,15 +530,34 @@ func generateSDPAnswer(request AnswerRequest) (AnswerResponse, error) {
 	// mutex.Lock()
 	// callIDToOffer[callID] = pc
 	// mutex.Unlock()
-	ch := make(chan actionData, 1)
-	details := callIDDetails{
+	closech := make(chan int, 1)
+	ch := make(chan ActionData, 1)
+	details := CallIDDetails{
 		pc: pc,
 		ch: ch, // buffered channel (optional)
 	}
-	actionChannels.Store(callID, details)
+	ActionChannels.Store(callID, details)
 
-	go autoRemovePeerConnection(callID, 45*time.Second)
-	go streamAudio(context.Background(), pc, "output.ogg", audioTrack, rtpSender, callID)
+	go autoRemovePeerConnection(callID, 45*time.Second, closech)
+
+	// go func {
+	// 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	// 	streamAudio(ctx, pc, "output.ogg", audioTrack, rtpSender, callID)
+	// 	defer cancel()
+	// }
+
+	go func() {
+		// ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		// defer ActionChannels.Delete(callID)
+		// defer log.Printf("Leaving generate loop: %s %s\n", callID, "generateSDPAnswer")
+		// defer cancel()
+		log.Printf("📩 Starting answer audio: %s\n", callID)
+		go streamAudio(pc, "output20ms.ogg", audioTrack, rtpSender, callID)
+		select {
+		case <-closech:
+			log.Printf("%s Timeout waiting for answer\n", callID)
+		}
+	}()
 
 	return AnswerResponse{
 		CallID: callID,
@@ -692,10 +625,10 @@ func main() {
 		// for _, pc := range callIDToOffer {
 		// 	pc.Close()
 		// }
-		actionChannels.Range(func(key, value any) bool {
-			details := value.(callIDDetails)
+		ActionChannels.Range(func(key, value any) bool {
+			details := value.(CallIDDetails)
 			details.pc.Close()
-			actionChannels.Delete(key)
+			ActionChannels.Delete(key)
 			return true
 		})
 		// mutex.Unlock()
